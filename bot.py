@@ -15,24 +15,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============ CONFIG ============
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-FORWARD_CHAT_ID = os.getenv("FORWARD_CHAT_ID", "YOUR_CHANNEL_OR_GROUP_ID")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+FORWARD_CHAT_ID = os.environ.get("FORWARD_CHAT_ID")
 VIDBUNKER_API = "https://vidbunker-backend.dailyweb577.workers.dev/api/download"
-DOWNLOAD_DIR = "downloads"
+DOWNLOAD_DIR = "/tmp/downloads"
 MAX_BATCH = 100
 # ================================
 
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable nahi mila!")
+if not FORWARD_CHAT_ID:
+    raise ValueError("FORWARD_CHAT_ID environment variable nahi mila!")
+
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Store pending URLs per user
-user_queue: dict[int, list[str]] = {}
+user_queue: dict = {}
 
 
-async def download_video(url: str, filename: str) -> str | None:
-    """Download video using vidbunker API"""
+async def download_video(url: str, filename: str):
     try:
         async with aiohttp.ClientSession() as session:
-            # Call vidbunker API
             params = {"url": url}
             async with session.get(VIDBUNKER_API, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status != 200:
@@ -40,7 +42,6 @@ async def download_video(url: str, filename: str) -> str | None:
                     return None
                 data = await resp.json()
 
-            # Get direct video URL from response
             video_url = (
                 data.get("url") or
                 data.get("download_url") or
@@ -53,7 +54,6 @@ async def download_video(url: str, filename: str) -> str | None:
                 logger.error(f"No video URL in response: {data}")
                 return None
 
-            # Download the actual video file
             filepath = os.path.join(DOWNLOAD_DIR, filename)
             async with session.get(video_url, timeout=aiohttp.ClientTimeout(total=300)) as video_resp:
                 if video_resp.status != 200:
@@ -69,12 +69,10 @@ async def download_video(url: str, filename: str) -> str | None:
         return None
 
 
-async def send_media_group(bot: Bot, chat_id: str, file_paths: list[str], caption: str = "") -> bool:
-    """Send up to 10 videos as media group"""
+async def send_media_group(bot, chat_id, file_paths, caption=""):
+    file_handles = []
     try:
         media = []
-        file_handles = []
-
         for i, path in enumerate(file_paths[:10]):
             fh = open(path, 'rb')
             file_handles.append(fh)
@@ -82,27 +80,20 @@ async def send_media_group(bot: Bot, chat_id: str, file_paths: list[str], captio
                 media=fh,
                 caption=caption if i == 0 else ""
             ))
-
         await bot.send_media_group(chat_id=chat_id, media=media)
-
-        for fh in file_handles:
-            fh.close()
         return True
-
     except TelegramError as e:
         logger.error(f"Media group error: {e}")
+        return False
+    finally:
         for fh in file_handles:
             fh.close()
-        return False
 
 
-async def process_and_forward(update: Update, context: ContextTypes.DEFAULT_TYPE, urls: list[str]):
-    """Download all videos and forward in media groups of 10"""
+async def process_and_forward(update: Update, context: ContextTypes.DEFAULT_TYPE, urls: list):
     bot = context.bot
     total = len(urls)
-    status_msg = await update.message.reply_text(
-        f"⏳ Processing {total} video(s)...\n0/{total} downloaded"
-    )
+    status_msg = await update.message.reply_text(f"⏳ Processing {total} video(s)...\n0/{total} downloaded")
 
     downloaded = []
     failed = 0
@@ -112,24 +103,18 @@ async def process_and_forward(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"⬇️ Downloading {i+1}/{total}...\n"
             f"✅ Done: {len(downloaded)} | ❌ Failed: {failed}"
         )
-
         filename = f"video_{i+1}_{update.message.message_id}.mp4"
         filepath = await download_video(url, filename)
-
         if filepath:
             downloaded.append(filepath)
         else:
             failed += 1
 
     if not downloaded:
-        await status_msg.edit_text("❌ Koi bhi video download nahi hua. URLs check karo.")
+        await status_msg.edit_text("❌ Koi bhi video download nahi hua. URL check karo.")
         return
 
-    # Forward in batches of 10 (media group limit)
-    await status_msg.edit_text(
-        f"📤 Forwarding {len(downloaded)} videos to channel...\n"
-        f"(Batches of 10)"
-    )
+    await status_msg.edit_text(f"📤 Forwarding {len(downloaded)} videos...")
 
     forwarded = 0
     batch_num = 0
@@ -143,22 +128,15 @@ async def process_and_forward(update: Update, context: ContextTypes.DEFAULT_TYPE
         if success:
             forwarded += len(batch)
         else:
-            # Try one by one if group fails
             for path in batch:
                 try:
                     with open(path, 'rb') as f:
-                        await bot.send_video(
-                            chat_id=FORWARD_CHAT_ID,
-                            video=f,
-                            caption=f"Video {forwarded+1}/{len(downloaded)}"
-                        )
+                        await bot.send_video(chat_id=FORWARD_CHAT_ID, video=f)
                     forwarded += 1
                 except Exception as e:
-                    logger.error(f"Single video send error: {e}")
+                    logger.error(f"Send error: {e}")
+        await asyncio.sleep(1)
 
-        await asyncio.sleep(1)  # Rate limit protection
-
-    # Cleanup downloaded files
     for path in downloaded:
         try:
             os.remove(path)
@@ -166,64 +144,47 @@ async def process_and_forward(update: Update, context: ContextTypes.DEFAULT_TYPE
             pass
 
     await status_msg.edit_text(
-        f"✅ Done!\n"
-        f"📤 Forwarded: {forwarded}/{total}\n"
-        f"❌ Failed: {failed}\n"
-        f"📍 Channel: {FORWARD_CHAT_ID}"
+        f"✅ Done!\n📤 Forwarded: {forwarded}/{total}\n❌ Failed: {failed}"
     )
 
 
-# ============ COMMAND HANDLERS ============
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *Video Downloader & Forwarder Bot*\n\n"
+        "🤖 *Video Downloader Bot*\n\n"
         "📌 *Commands:*\n"
-        "/dl `<URL>` — Single video download & forward\n"
-        "/batch — Batch mode (send URLs one by one, then /send)\n"
-        "/send — Forward all queued URLs (max 100)\n"
-        "/clear — Clear queue\n"
-        "/status — Check queue\n\n"
-        "🔗 Supported: YouTube, Instagram, TikTok, Facebook, etc.\n"
-        "📦 Max batch: 100 videos",
+        "/dl `<URL>` — Single video\n"
+        "/batch — Batch mode shuru karo\n"
+        "/send — Queue forward karo (max 100)\n"
+        "/clear — Queue saaf karo\n"
+        "/status — Queue dekho",
         parse_mode="Markdown"
     )
 
 
 async def dl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Download single video: /dl <URL>"""
     if not context.args:
         await update.message.reply_text("❌ Usage: /dl <video_url>")
         return
-
     url = context.args[0]
     await process_and_forward(update, context, [url])
 
 
 async def batch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start batch mode"""
     user_id = update.effective_user.id
     user_queue[user_id] = []
     await update.message.reply_text(
-        "📋 *Batch mode ON!*\n\n"
-        "Ab video URLs bhejo (ek ek karke ya space se alag karke).\n"
-        "Jab sab URLs dedo, /send likhke forward karo.\n"
-        "Max: 100 URLs\n\n"
-        "Queue clear karne ke liye: /clear",
+        "📋 *Batch mode ON!*\n\nURLs bhejo (ek ek ya space se alag).\n/send se forward karo.\nMax: 100 URLs",
         parse_mode="Markdown"
     )
 
 
 async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send all queued URLs"""
     user_id = update.effective_user.id
     urls = user_queue.get(user_id, [])
-
     if not urls:
-        await update.message.reply_text("❌ Queue empty hai! Pehle /batch mode mein URLs daalo.")
+        await update.message.reply_text("❌ Queue empty! Pehle /batch mode mein URLs daalo.")
         return
-
-    await update.message.reply_text(f"🚀 Starting: {len(urls)} videos process ho rahe hain...")
+    await update.message.reply_text(f"🚀 {len(urls)} videos process ho rahe hain...")
     user_queue[user_id] = []
     await process_and_forward(update, context, urls)
 
@@ -232,7 +193,7 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     count = len(user_queue.get(user_id, []))
     user_queue[user_id] = []
-    await update.message.reply_text(f"🗑️ Queue cleared! {count} URLs remove kiye gaye.")
+    await update.message.reply_text(f"🗑️ {count} URLs remove kiye.")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,50 +204,38 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         url_list = "\n".join([f"{i+1}. {u[:50]}..." for i, u in enumerate(urls[:10])])
         more = f"\n...aur {len(urls)-10} aur" if len(urls) > 10 else ""
-        await update.message.reply_text(
-            f"📋 *Queue Status:* {len(urls)}/100 URLs\n\n{url_list}{more}",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"📋 Queue: {len(urls)}/100\n\n{url_list}{more}", parse_mode="Markdown")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages - add URLs to queue if in batch mode"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
     if user_id not in user_queue:
-        await update.message.reply_text(
-            "💡 Tip: /batch mode mein URLs queue karo, ya /dl <url> se seedha download karo."
-        )
+        await update.message.reply_text("💡 /batch mode mein URLs queue karo, ya /dl <url> se download karo.")
         return
 
-    # Extract URLs from message
     urls = [word for word in text.split() if word.startswith("http")]
-
     if not urls:
-        await update.message.reply_text("❌ Koi valid URL nahi mila. http/https se shuru hona chahiye.")
+        await update.message.reply_text("❌ Valid URL nahi mila.")
         return
 
     current = user_queue[user_id]
     remaining = MAX_BATCH - len(current)
-
     if remaining <= 0:
-        await update.message.reply_text(f"⚠️ Queue full hai! (Max {MAX_BATCH}). /send karo pehle.")
+        await update.message.reply_text(f"⚠️ Queue full! /send karo pehle.")
         return
 
     added = urls[:remaining]
     user_queue[user_id].extend(added)
-
     await update.message.reply_text(
-        f"✅ {len(added)} URL(s) queue mein add hue.\n"
-        f"📋 Total: {len(user_queue[user_id])}/100\n\n"
-        f"Forward karne ke liye: /send"
+        f"✅ {len(added)} URL(s) add hue.\n📋 Total: {len(user_queue[user_id])}/100\n/send se forward karo."
     )
 
 
 def main():
+    logger.info("Bot start ho raha hai...")
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("dl", dl_command))
     app.add_handler(CommandHandler("batch", batch_command))
@@ -294,8 +243,7 @@ def main():
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("Bot start ho gaya!")
+    logger.info("Bot chal raha hai!")
     app.run_polling(drop_pending_updates=True)
 
 
