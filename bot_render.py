@@ -8,7 +8,7 @@ from pymongo import MongoClient
 from keep_alive import keep_alive
 
 # ===== CONFIG =====
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8621971400:AAF2zj0tHDPbq9y6RjAQFKDZ-XA3i5Q2iUQ")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8690095871:AAHVf3A932fWfPxga5GMFWEPo2MVT_Pwnvs")
 TARGET_GROUP_ID = int(os.environ.get("TARGET_GROUP_ID", "-1003984128597"))
 API_URL = "https://vidbunker-backend.dailyweb577.workers.dev/api/download"
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://Newpaymentsystem:Bt8ORL0eECtlShZE@cluster0.v1ipgab.mongodb.net/?appName=Cluster0")
